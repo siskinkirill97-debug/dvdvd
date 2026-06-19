@@ -8,7 +8,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 
-import asyncpg
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -21,6 +20,7 @@ from aiogram.types import (
 )
 from aiogram.exceptions import TelegramBadRequest
 
+import aiosqlite
 import openai
 
 try:
@@ -29,15 +29,11 @@ try:
 except ImportError:
     REDIS_AVAILABLE = False
 
-from dotenv import load_dotenv
-load_dotenv()
-
 # --- Настройки окружения ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-REDIS_URL = os.getenv("REDIS_URL", "")
-GEMINI_WEB2API_URL = os.getenv("GEMINI_WEB2API_URL", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8852189134:AAEQ7FlnP_xjVlFRIN-GvoIpt71-vNOoHGc")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost")
+GEMINI_WEB2API_URL = os.getenv("GEMINI_WEB2API_URL", "http://localhost:8081/v1")
 ADMIN_ID = 1183393935
-DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 DEFAULT_MODEL = "gemini-3.5-flash"
 FALLBACK_MODELS = ["gemini-3.1-pro", "gemini-3.5-flash-thinking-lite", "gemini-3.5-flash-thinking", "gemini-flash-lite"]
@@ -63,9 +59,6 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# --- Пул подключений к PostgreSQL ---
-db_pool: asyncpg.Pool = None
-
 # --- Модели данных ---
 @dataclass
 class UserProfile:
@@ -84,14 +77,14 @@ class UserProfile:
     habits: str = ""
     utc_offset: int = 3
 
-# --- База данных (PostgreSQL) ---
+# --- База данных ---
+DB_NAME = "nutrition_bot.db"
+
 async def init_db():
-    global db_pool
-    db_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=2, max_size=10)
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.executescript("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
+                user_id INTEGER PRIMARY KEY,
                 language TEXT DEFAULT 'ru',
                 weight REAL DEFAULT 70.0,
                 height REAL DEFAULT 170.0,
@@ -105,14 +98,14 @@ async def init_db():
                 sport_types TEXT DEFAULT '',
                 habits TEXT DEFAULT '',
                 utc_offset INTEGER DEFAULT 3,
-                subscribed_until TIMESTAMPTZ,
+                subscribed_until TEXT,
                 trial_used INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS food_diary (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-                date DATE,
-                meal_time TIME,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                date TEXT,
+                meal_time TEXT,
                 description TEXT,
                 calories REAL,
                 protein REAL,
@@ -122,133 +115,121 @@ async def init_db():
                 UNIQUE(user_id, date, meal_time, description)
             );
             CREATE TABLE IF NOT EXISTS reminders (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-                time TIME,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                time TEXT,
                 text TEXT,
                 active INTEGER DEFAULT 1
             );
         """)
+        await db.commit()
 
 # --- Утилиты БД ---
 async def get_user(user_id: int) -> Optional[UserProfile]:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
-        if row:
-            return UserProfile(
-                user_id=row['user_id'],
-                language=row['language'],
-                weight=row['weight'],
-                height=row['height'],
-                age=row['age'],
-                gender=row['gender'],
-                activity=row['activity'],
-                goal=row['goal'],
-                allergies=row['allergies'],
-                favorite_foods=row['favorite_foods'],
-                disliked_foods=row['disliked_foods'],
-                sport_types=row['sport_types'],
-                habits=row['habits'],
-                utc_offset=row['utc_offset']
-            )
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return UserProfile(
+                    user_id=row['user_id'],
+                    language=row['language'],
+                    weight=row['weight'],
+                    height=row['height'],
+                    age=row['age'],
+                    gender=row['gender'],
+                    activity=row['activity'],
+                    goal=row['goal'],
+                    allergies=row['allergies'],
+                    favorite_foods=row['favorite_foods'],
+                    disliked_foods=row['disliked_foods'],
+                    sport_types=row['sport_types'],
+                    habits=row['habits'],
+                    utc_offset=row['utc_offset']
+                )
     return None
 
 async def save_user(profile: UserProfile):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (user_id, language, weight, height, age, gender, activity, goal,
-                               allergies, favorite_foods, disliked_foods, sport_types, habits, utc_offset)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-            ON CONFLICT (user_id) DO UPDATE SET
-                language = EXCLUDED.language,
-                weight = EXCLUDED.weight,
-                height = EXCLUDED.height,
-                age = EXCLUDED.age,
-                gender = EXCLUDED.gender,
-                activity = EXCLUDED.activity,
-                goal = EXCLUDED.goal,
-                allergies = EXCLUDED.allergies,
-                favorite_foods = EXCLUDED.favorite_foods,
-                disliked_foods = EXCLUDED.disliked_foods,
-                sport_types = EXCLUDED.sport_types,
-                habits = EXCLUDED.habits,
-                utc_offset = EXCLUDED.utc_offset
-        """, profile.user_id, profile.language, profile.weight, profile.height,
-            profile.age, profile.gender, profile.activity, profile.goal,
-            profile.allergies, profile.favorite_foods, profile.disliked_foods,
-            profile.sport_types, profile.habits, profile.utc_offset)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""INSERT OR REPLACE INTO users 
+            (user_id, language, weight, height, age, gender, activity, goal, allergies,
+             favorite_foods, disliked_foods, sport_types, habits, utc_offset)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (profile.user_id, profile.language, profile.weight, profile.height,
+             profile.age, profile.gender, profile.activity, profile.goal,
+             profile.allergies, profile.favorite_foods, profile.disliked_foods,
+             profile.sport_types, profile.habits, profile.utc_offset))
+        await db.commit()
 
 async def update_subscription(user_id: int, days: int):
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT subscribed_until FROM users WHERE user_id=$1", user_id)
-        current = row['subscribed_until'] if row and row['subscribed_until'] else None
-        if current:
-            until = current + timedelta(days=days)
-        else:
-            until = datetime.now(timezone.utc) + timedelta(days=days)
-        await conn.execute("UPDATE users SET subscribed_until=$1 WHERE user_id=$2", until, user_id)
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT subscribed_until FROM users WHERE user_id=?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            current = row[0] if row and row[0] else None
+            until = datetime.fromisoformat(current) if current else datetime.now(timezone.utc)
+        new_until = until + timedelta(days=days)
+        await db.execute("UPDATE users SET subscribed_until=? WHERE user_id=?", (new_until.isoformat(), user_id))
+        await db.commit()
 
 async def is_subscribed(user_id: int) -> bool:
     if user_id == ADMIN_ID:
         return True
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT subscribed_until, trial_used FROM users WHERE user_id=$1", user_id)
-        if not row:
-            return False
-        sub_until, trial_used = row['subscribed_until'], row['trial_used']
-        if sub_until and sub_until > datetime.now(timezone.utc):
-            return True
-        if not trial_used:
-            return True
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT subscribed_until, trial_used FROM users WHERE user_id=?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            sub_until, trial_used = row
+            if sub_until:
+                try:
+                    if datetime.fromisoformat(sub_until) > datetime.now(timezone.utc):
+                        return True
+                except:
+                    pass
+            if not trial_used:
+                return True
     return False
 
 async def activate_trial(user_id: int):
-    async with db_pool.acquire() as conn:
+    async with aiosqlite.connect(DB_NAME) as db:
         trial_end = datetime.now(timezone.utc) + timedelta(days=3)
-        await conn.execute("UPDATE users SET subscribed_until=$1, trial_used=1 WHERE user_id=$2",
-                           trial_end, user_id)
+        await db.execute("UPDATE users SET subscribed_until=?, trial_used=1 WHERE user_id=?",
+                         (trial_end.isoformat(), user_id))
+        await db.commit()
 
 async def add_food_entry(user_id: int, date: str, meal_time: str, description: str,
                          calories: float, protein: float, fat: float, carbs: float, photo_id=None):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO food_diary (user_id, date, meal_time, description, calories, protein, fat, carbs, photo_id)
-            VALUES ($1, $2, $3::time, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (user_id, date, meal_time, description) DO UPDATE SET
-                calories = EXCLUDED.calories,
-                protein = EXCLUDED.protein,
-                fat = EXCLUDED.fat,
-                carbs = EXCLUDED.carbs,
-                photo_id = EXCLUDED.photo_id
-        """, user_id, date, meal_time, description, calories, protein, fat, carbs, photo_id)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""INSERT OR REPLACE INTO food_diary 
+            (user_id, date, meal_time, description, calories, protein, fat, carbs, photo_id)
+            VALUES (?,?,?,?,?,?,?,?,?)""",
+            (user_id, date, meal_time, description, calories, protein, fat, carbs, photo_id))
+        await db.commit()
 
 async def delete_food_entry(entry_id: int, user_id: int) -> bool:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "DELETE FROM food_diary WHERE id=$1 AND user_id=$2 RETURNING id", entry_id, user_id
-        )
-        return row is not None
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("DELETE FROM food_diary WHERE id=? AND user_id=?", (entry_id, user_id))
+        await db.commit()
+        return cursor.rowcount > 0
 
 async def get_daily_food(user_id: int, date: str) -> List[dict]:
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM food_diary WHERE user_id=$1 AND date=$2 ORDER BY meal_time", user_id, date
-        )
-        return [dict(row) for row in rows]
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM food_diary WHERE user_id=? AND date=? ORDER BY meal_time",
+                              (user_id, date)) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
 
 async def get_user_reminders(user_id: int) -> List[dict]:
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM reminders WHERE user_id=$1 AND active=1 ORDER BY time", user_id
-        )
-        return [dict(row) for row in rows]
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM reminders WHERE user_id=? AND active=1 ORDER BY time", (user_id,)) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
 
 async def delete_reminder(reminder_id: int, user_id: int) -> bool:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "DELETE FROM reminders WHERE id=$1 AND user_id=$2 RETURNING id", reminder_id, user_id
-        )
-        return row is not None
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("DELETE FROM reminders WHERE id=? AND user_id=?", (reminder_id, user_id))
+        await db.commit()
+        return cursor.rowcount > 0
 
 # --- КАЛЬКУЛЯТОР НОРМЫ ---
 def calculate_daily_calories(profile: UserProfile) -> float:
@@ -275,7 +256,7 @@ def calculate_daily_calories(profile: UserProfile) -> float:
     else:
         return tdee
 
-# --- ЛОКАЛИЗАЦИЯ ---
+# --- ЛОКАЛИЗАЦИЯ (полные строки с эмодзи) ---
 LOCALE = {
     "ru": {
         "welcome": "Привет! Я твой персональный ИИ-нутрициолог. Выбери язык / Choose language:",
@@ -1192,10 +1173,11 @@ async def cancel_food(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
-# --- Редактирование профиля ---
+# --- Редактирование профиля (теперь показывает текущее значение) ---
 CLEARABLE_FIELDS = {"allergies", "favorite_foods", "disliked_foods", "sport_types", "habits"}
 
 def get_current_field_value(profile: UserProfile, field: str, lang: str) -> str:
+    """Возвращает строку с текущим значением поля для отображения."""
     if field == "gender":
         return t(lang, f"gender.{profile.gender}")
     elif field == "activity":
@@ -1207,7 +1189,7 @@ def get_current_field_value(profile: UserProfile, field: str, lang: str) -> str:
     else:
         val = getattr(profile, field, "")
         if isinstance(val, str) and not val:
-            return "—"
+            return "—"  # пусто
         return str(val)
 
 @router.callback_query(F.data.startswith("edit_field_"))
@@ -1459,9 +1441,10 @@ async def add_reminder(message: Message):
         await message.answer(t(lang, "reminder_add_info"))
         return
 
-    async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO reminders (user_id, time, text) VALUES ($1, $2::time, $3)",
-                           user_id, normalized_time, reminder_text)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT INTO reminders (user_id, time, text) VALUES (?, ?, ?)",
+                         (user_id, normalized_time, reminder_text))
+        await db.commit()
 
     await message.answer(t(lang, "reminder_added", time=normalized_time, text=reminder_text))
 
@@ -1548,54 +1531,58 @@ async def unhandled_callback(callback: CallbackQuery):
 async def reminder_scheduler():
     while True:
         now = datetime.now(timezone.utc)
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM reminders WHERE active=1")
-            for row in rows:
-                rem_time = row['time']
-                user = await get_user(row['user_id'])
-                offset = user.utc_offset if user else 0
-                local_now = now + timedelta(hours=offset)
-                if local_now.hour == rem_time.hour and local_now.minute == rem_time.minute:
-                    try:
-                        await bot.send_message(row['user_id'], f"⏰ {row['text']}")
-                    except:
-                        pass
+        async with aiosqlite.connect(DB_NAME) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM reminders WHERE active=1") as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    rem_time = datetime.strptime(row['time'], "%H:%M").time()
+                    user = await get_user(row['user_id'])
+                    offset = user.utc_offset if user else 0
+                    local_now = now + timedelta(hours=offset)
+                    if local_now.hour == rem_time.hour and local_now.minute == rem_time.minute:
+                        try:
+                            await bot.send_message(row['user_id'], f"⏰ {row['text']}")
+                        except:
+                            pass
         await asyncio.sleep(60)
 
 async def daily_summary_scheduler():
     while True:
         now = datetime.now(timezone.utc)
-        async with db_pool.acquire() as conn:
-            users = await conn.fetch("SELECT user_id, utc_offset, language FROM users")
-            for user in users:
-                user_id = user['user_id']
-                offset = user['utc_offset']
-                lang = user['language'] or 'ru'
-                local_hour = (now + timedelta(hours=offset)).hour
-                if local_hour == 21:
-                    today_str = now.strftime("%Y-%m-%d")
-                    entries = await get_daily_food(user_id, today_str)
-                    if entries:
-                        total_cal = sum(e['calories'] for e in entries)
-                        total_prot = sum(e['protein'] for e in entries)
-                        total_fat = sum(e['fat'] for e in entries)
-                        total_carbs = sum(e['carbs'] for e in entries)
-                        profile = await get_user(user_id)
-                        if profile:
-                            norm = calculate_daily_calories(profile)
-                            diff = norm - total_cal
-                            if diff > 100:
-                                advice = t(lang, "daily_summary_under")
-                            elif diff < -100:
-                                advice = t(lang, "daily_summary_over")
-                            else:
-                                advice = t(lang, "daily_summary_ok")
-                            text = t(lang, "daily_summary", date=today_str, consumed=total_cal, norm=norm,
-                                     p=total_prot, f=total_fat, c=total_carbs, advice=advice)
-                            try:
-                                await bot.send_message(user_id, text, parse_mode="Markdown")
-                            except:
-                                pass
+        async with aiosqlite.connect(DB_NAME) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT user_id, utc_offset, language FROM users") as cursor:
+                users = await cursor.fetchall()
+                for user in users:
+                    user_id = user['user_id']
+                    offset = user['utc_offset']
+                    lang = user['language'] if user['language'] else 'ru'
+                    local_hour = (now + timedelta(hours=offset)).hour
+                    if local_hour == 21:
+                        today_str = now.strftime("%Y-%m-%d")
+                        entries = await get_daily_food(user_id, today_str)
+                        if entries:
+                            total_cal = sum(e['calories'] for e in entries)
+                            total_prot = sum(e['protein'] for e in entries)
+                            total_fat = sum(e['fat'] for e in entries)
+                            total_carbs = sum(e['carbs'] for e in entries)
+                            profile = await get_user(user_id)
+                            if profile:
+                                norm = calculate_daily_calories(profile)
+                                diff = norm - total_cal
+                                if diff > 100:
+                                    advice = t(lang, "daily_summary_under")
+                                elif diff < -100:
+                                    advice = t(lang, "daily_summary_over")
+                                else:
+                                    advice = t(lang, "daily_summary_ok")
+                                text = t(lang, "daily_summary", date=today_str, consumed=total_cal, norm=norm,
+                                         p=total_prot, f=total_fat, c=total_carbs, advice=advice)
+                                try:
+                                    await bot.send_message(user_id, text, parse_mode="Markdown")
+                                except:
+                                    pass
         await asyncio.sleep(3600)
 
 # --- Запуск ---
